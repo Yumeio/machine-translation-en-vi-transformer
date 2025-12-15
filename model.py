@@ -35,7 +35,6 @@ class PositionalEncoding(nn.Module):
         return x
 
 class LayerNormalization(nn.Module):
-
     def __init__(self, d_model: int, eps: float = 10**-6) -> None:
         super().__init__()
         self.eps = eps
@@ -259,6 +258,17 @@ class Transformer(nn.Module):
         
         # Projection layer
         self.projection = ProjectionLayer(d_model, tgt_vocab_size)
+        self._init_xavier_weights()
+    
+    def _init_xavier_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _sum_parameter(self):
+        return sum(p.numel() for p in self.parameters())
     
     def encode(self, src, src_mask):
         src = self.src_embedding(src)
@@ -277,3 +287,5 @@ class Transformer(nn.Module):
         encoder_output = self.encode(src, src_mask)
         decoder_output = self.decode(tgt, encoder_output, src_mask, tgt_mask)
         return self.project(decoder_output)
+
+    

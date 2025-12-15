@@ -51,6 +51,7 @@ def train_model(config):
 
     # 2. Build Model
     model = get_model(config, src_vocab_size, tgt_vocab_size).to(device)
+    print(f"Number of parameters: {model._sum_parameter()}")
 
     # 3. Optimizer
     optim_cls = AdamW if config.training.optim_type == "adamw" else Adam 
