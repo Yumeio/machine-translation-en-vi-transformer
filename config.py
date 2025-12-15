@@ -16,7 +16,7 @@ class DatasetConfig:
 class ModelConfig:
     d_model: int = 512
     num_heads: int = 8
-    d_ff: int = 2048
+    d_ff: int = 512 * 4
     activation: Literal['relu', 'gelu'] = "gelu"
     dropout: float = 0.1
     num_encoder_blocks: int = 6
@@ -27,9 +27,9 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 24
+    batch_size: int = 16
     num_epochs: int = 20
-    lr: float = 10**-4
+    lr: float = 4e-4
     weight_decay: float = 1e-5
     optim_type: Literal["adam", "adamw"] = "adamw"
     model_folder: str = "weights"

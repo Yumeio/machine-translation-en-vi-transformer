@@ -10,7 +10,11 @@ from data_loader import get_dataloaders
 from model import Transformer
 from optim import AdamW, Adam
 from lr_scheduler import LRScheduler
+
 from utils import get_device, set_seed
+import matplotlib.pyplot as plt
+from metric import get_metric
+from infer import greedy_decode, beam_search_decode
 
 def get_model(config, src_vocab_size, tgt_vocab_size):
     model = Transformer(
@@ -94,10 +98,22 @@ def train_model(config):
     writer = SummaryWriter(config.training.experiment_name)
 
     # 7. Training Loop
+    train_losses = []
+    val_losses = []
+    val_bleus = []
+    
+    # Placeholders for last validation result
+    last_predicted = []
+    last_expected = []
+    last_source = []
+
     for epoch in range(initial_epoch, config.training.num_epochs):
         torch.cuda.empty_cache()
         model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
+        
+        epoch_loss = 0
+        num_batches = 0 
         
         for batch in batch_iterator:
             encoder_input = batch['encoder_input'].to(device) # (B, Seq_Len)
@@ -129,10 +145,20 @@ def train_model(config):
             scheduler.step() # Update LR
             optimizer.zero_grad(set_to_none=True)
 
+            epoch_loss += loss.item()
+            num_batches += 1
             global_step += 1
+            
+        avg_train_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        train_losses.append(avg_train_loss)
 
         # Validation at end of epoch
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config.model.max_seq_len, device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        val_loss, val_bleu, last_predicted, last_expected, last_source = run_validation(
+            model, val_dataloader, tokenizer_src, tokenizer_tgt, config.model.max_seq_len, device, 
+            lambda msg: batch_iterator.write(msg), global_step, writer
+        )
+        val_losses.append(val_loss)
+        val_bleus.append(val_bleu)
 
         # Save model
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
@@ -143,27 +169,65 @@ def train_model(config):
             'global_step': global_step
         }, model_filename)
 
+    # Plotting Loss
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.savefig('loss_plot.png')
+    print("Saved loss plot to loss_plot.png")
+    
+    # Plotting BLEU
+    plt.figure(figsize=(10, 5))
+    plt.plot(val_bleus, label='Validation BLEU')
+    plt.xlabel('Epoch')
+    plt.ylabel('BLEU Score')
+    plt.legend()
+    plt.title('Validation BLEU Score')
+    plt.savefig('bleu_plot.png')
+    print("Saved BLEU plot to bleu_plot.png")
+
+    # Final Metrics Reporting
+    print(f"Final Validation BLEU: {val_bleus[-1] if val_bleus else 0.0}")
+    
+    # Gemini Score Calculation (on a subset of last validation epoch to save time/cost)
+    # Let's take first 10 examples
+    subset_size = min(10, len(last_predicted))
+    if subset_size > 0:
+        print("Calculating Gemini Score on subset...")
+        gemini_metric = get_metric("gemini", device)
+        gemini_score = gemini_metric.compute(
+            last_predicted[:subset_size], 
+            last_expected[:subset_size], 
+            sources=last_source[:subset_size]
+        )
+        print(f"Gemini Score (on {subset_size} samples): {gemini_score}")
+        writer.add_scalar('gemini_score', gemini_score, global_step)
+        writer.flush()
+
 def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer):
     model.eval()
     count = 0
     
-    # We can just show a few examples or compute loss. 
-    # Let's compute validation loss first.
-    # Re-instantiate loss function for validation just to be safe it's clean or same inst
     pad_token_id = tokenizer_tgt.token_to_id("[PAD]")
     loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=0.1).to(device)
     
     total_val_loss = 0
     num_batches = 0
+    
+    source_texts = []
+    expected = []
+    predicted = []
 
     # Console width
     try:
-        # get the console window width
         with os.popen('stty size', 'r') as console:
             _, console_width = console.read().split()
             console_width = int(console_width)
     except:
-        # If we can't get the console width, use 80 as default
         console_width = 80
         
     with torch.no_grad():
@@ -176,21 +240,73 @@ def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len,
 
             proj_output = model(encoder_input, decoder_input, encoder_mask, decoder_mask)
             
-            # Compute Val Loss
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
             total_val_loss += loss.item()
             num_batches += 1
             
-            # Print Examples (limit to 2 per validation run)
-            # This requires Greedy Decode or Beam Search (not implemented in model directly yet)
-            # For now, just logging loss is better than failing if greedy_decode isn't ready.
-            # But the user might want translation examples.
+            src_text = batch['src_texts']
+            tgt_text = batch['tgt_texts']
+            source_texts.extend(src_text)
+            expected.extend(tgt_text)
             
-    if num_batches > 0:
-        avg_val_loss = total_val_loss / num_batches
-        writer.add_scalar('val_loss', avg_val_loss, global_step)
-        writer.flush()
-        print_msg(f"Validation Loss: {avg_val_loss:.3f}")
+            # Batch decoding for BLEU (decoding one by one is slow but simple)
+            # greedy_decode expects single item source, so we iterate
+            
+            for i in range(encoder_input.size(0)):
+                source = encoder_input[i].contiguous().view(1, -1)
+                source_mask = encoder_mask[i].contiguous() # (1, 1, seq_len)
+                
+                # Check dimensions of source_mask, greedy_decode expects (1, 1, 1, seq_len) or similar? 
+                # greedy_decode uses it in encode: model.encode(source, source_mask)
+                # In train loop: encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, Seq_Len)
+                # So here: encoder_mask[i] is (1, 1, Seq_Len) -> needs to be (1, 1, 1, Seq_Len)?
+                # No, batch['encoder_mask'] is usually (B, 1, 1, Seq_Len) or (B, 1, Seq_Len) depending on implementation.
+                # In dataset.py usually it is (1, 1, Seq_Len) for padding mask. 
+                # Let's trust greedy_decode handles (1, 1, 1, Seq_Len) if we pass it correctly.
+                # Actually greedy_decode takes what model.encode takes.
+                
+                model_out = greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+                model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+                predicted.append(model_out_text)
+                
+                # Print to console just a few (2 examples)
+                if count < 2:
+                    print_msg('-'*console_width)
+                    print_msg(f"{f'SOURCE: ':>12}{src_text[i]}")
+                    print_msg(f"{f'TARGET: ':>12}{tgt_text[i]}")
+                    print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
+                    count += 1
+            
+    avg_val_loss = total_val_loss / num_batches if num_batches > 0 else 0
+    writer.add_scalar('val_loss', avg_val_loss, global_step)
+    
+    # Compute BLEU
+    metric = get_metric("bleu", device)
+    # BLEU expects list of strings for preds, list of list of strings for refs? 
+    # TorchMetrics BLEUScore expects preds (List[str]) and target (List[List[str]]) usually? 
+    # Or just List[str] if 1 ref.
+    # Let's check torchmetrics documentation or error. Usually target is List[str] or List[List[str]].
+    # For single reference, List[str] might work or List[[ref]]. 
+    # Checking my knowledge: BLEUScore(preds, target). target shape same as preds? 
+    # No, target is usually list of references. 
+    # Let's wrap each expected in a list just in case: [[ref1], [ref2], ...] is standard for multi-ref.
+    # But usually 1-1 is fine if allowed. Let's try simple list first, if fail then list of lists.
+    # Actually, let's look at `metric.py` usage. It just returns `BLEUScore()`.
+    # I'll update `predicted` and `expected` to be compatible.
+    
+    # expected needs to be list of strings? 
+    # Torchmetrics BLEU: preds: Sequence[str], target: Sequence[Sequence[str]]
+    
+    try:
+        bleu = metric(predicted, [[x] for x in expected])
+        writer.add_scalar('validation_bleu', bleu, global_step)
+        print_msg(f"Validation Loss: {avg_val_loss:.3f} | BLEU: {bleu:.4f}")
+    except Exception as e:
+        print_msg(f"Validation Loss: {avg_val_loss:.3f} | BLEU Error: {e}")
+        bleu = 0.0
+
+    writer.flush()
+    return avg_val_loss, bleu, predicted, expected, source_texts
 
 if __name__ == '__main__':
     config = get_config()
