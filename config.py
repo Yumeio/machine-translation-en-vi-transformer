@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 from pathlib import Path
 
+import json
+
 @dataclass
 class DatasetConfig:
     train_path: str = "./dataset/processed/train.parquet"
@@ -41,7 +43,21 @@ class Config:
     training: TrainingConfig
     dataset: DatasetConfig
 
-def get_config() -> Config:
+def get_config(config_path: str = "best_config.json") -> Config:
+    if Path(config_path).exists():
+        try:
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            print(f"Loading config from {config_path}")
+            return Config(
+                model=ModelConfig(**config_data.get('model', {})),
+                training=TrainingConfig(**config_data.get('training', {})),
+                dataset=DatasetConfig(**config_data.get('dataset', {}))
+            )
+        except Exception as e:
+            print(f"Error loading config from {config_path}: {e}.  Using default config.")
+    
     return Config(
         model=ModelConfig(),
         training=TrainingConfig(),
