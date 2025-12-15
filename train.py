@@ -275,7 +275,16 @@ def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len,
                     print_msg('-'*console_width)
                     print_msg(f"{f'SOURCE: ':>12}{src_text[i]}")
                     print_msg(f"{f'TARGET: ':>12}{tgt_text[i]}")
-                    print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
+                    print_msg(f"{f'PRED GREEDY: ':>12}{model_out_text}")
+                    
+                    # Also compute beam search for visualization
+                    beam_out = beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size=3)
+                    beam_out_text = tokenizer_tgt.decode(beam_out.detach().cpu().numpy())
+                    print_msg(f"{f'PRED BEAM: ':>12}{beam_out_text}")
+                    
+                    if not model_out_text:
+                        print_msg(f"{f'NOTE: ':>12}Greedy prediction is empty (likely only EOS predicted).")
+                    
                     count += 1
             
     avg_val_loss = total_val_loss / num_batches if num_batches > 0 else 0
