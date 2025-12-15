@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+tokenizers
+datasets
+pandas
+tqdm
+torchmetrics
+optuna
+gradio
+tensorboard
+gdown
