@@ -111,7 +111,7 @@ def train_model(config):
     for epoch in range(initial_epoch, config.training.num_epochs):
         torch.cuda.empty_cache()
         model.train()
-        batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
+        batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}", ascii=True, ncols=100)
         
         epoch_loss = 0
         num_batches = 0 
@@ -173,6 +173,7 @@ def train_model(config):
         }, model_filename)
 
     # Plotting Loss
+    matplotlib.use('Agg')
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -308,5 +309,6 @@ def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len,
 
 if __name__ == '__main__':
     config = get_config()
-    config.training.batch_size = 200
+    # config.training.batch_size = 128
+    # config.training.num_workers = 16
     train_model(config)

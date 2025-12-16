@@ -21,7 +21,7 @@ class ModelConfig:
     dropout: float = 0.1
     num_encoder_blocks: int = 6
     num_decoder_blocks: int = 6
-    max_seq_len: int = 350
+    max_seq_len: int = 128
     src_vocab_size: Optional[int] = 30000 
     tgt_vocab_size: Optional[int] = 30000 
 
