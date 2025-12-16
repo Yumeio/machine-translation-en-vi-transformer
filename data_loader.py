@@ -68,14 +68,21 @@ def get_dataloaders(config: Config):
         batch_size=config.training.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=config.training.num_workers
+        pin_memory=True,
+        persistent_workers=True,
+        num_workers=config.training.num_workers,
+        prefetch_factor=config.training.prefetch_factor,
     )
 
     val_dataloader = DataLoader(
         val_ds,
         batch_size=config.training.batch_size,
         shuffle=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        num_workers=config.training.num_workers,
+        prefetch_factor=config.training.prefetch_factor,
     )
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt

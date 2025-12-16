@@ -28,7 +28,8 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 16
-    num_workers: int = 4
+    num_workers: int = 1
+    prefetch_factor: int = 2
     num_epochs: int = 20
     lr: float = 4e-4
     weight_decay: float = 1e-5
