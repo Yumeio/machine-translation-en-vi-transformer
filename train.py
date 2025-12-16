@@ -102,7 +102,6 @@ def train_model(config):
     train_losses = []
     val_losses = []
     val_bleus = []
-    val_geminis = []
     
     # Placeholders for last validation result
     last_predicted = []
@@ -161,23 +160,8 @@ def train_model(config):
         )
         val_losses.append(val_loss)
         val_bleus.append(val_bleu)
+        batch_iterator.write(f"Epoch {epoch:02d} Summary | Validation Loss: {val_loss:.3f} | BLEU: {val_bleu:.4f}")
 
-        # Gemini Score Calculation (on a subset of validation data to save time/cost)
-        subset_size = min(10, len(last_predicted))
-        if subset_size > 0:
-            # batch_iterator.write("Calculating Gemini Score on subset...")
-            gemini_metric = get_metric("gemini", device)
-            gemini_score = gemini_metric.compute(
-                last_predicted[:subset_size], 
-                last_expected[:subset_size], 
-                sources=last_source[:subset_size]
-            )
-            val_geminis.append(gemini_score)
-            writer.add_scalar('gemini_score', gemini_score, global_step)
-            batch_iterator.write(f"Epoch {epoch:02d} Summary | Validation Loss: {val_loss:.3f} | BLEU: {val_bleu:.4f} | Gemini Score: {gemini_score:.2f}")
-        else:
-            val_geminis.append(0.0)
-            batch_iterator.write(f"Epoch {epoch:02d} Summary | Validation Loss: {val_loss:.3f} | BLEU: {val_bleu:.4f} | Gemini Score: 0.00")
 
         # Save model
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
@@ -209,19 +193,9 @@ def train_model(config):
     plt.savefig('bleu_plot.png')
     print("Saved BLEU plot to bleu_plot.png")
 
-    # Plotting Gemini Score
-    plt.figure(figsize=(10, 5))
-    plt.plot(val_geminis, label='Validation Gemini Score')
-    plt.xlabel('Epoch')
-    plt.ylabel('Gemini Score')
-    plt.legend()
-    plt.title('Validation Gemini Score')
-    plt.savefig('gemini_plot.png')
-    print("Saved Gemini plot to gemini_plot.png")
 
     # Final Metrics Reporting
     print(f"Final Validation BLEU: {val_bleus[-1] if val_bleus else 0.0}")
-    print(f"Final Validation Gemini Score: {val_geminis[-1] if val_geminis else 0.0}")
 
 def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer):
     model.eval()
@@ -334,4 +308,5 @@ def run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, max_len,
 
 if __name__ == '__main__':
     config = get_config()
+    config.training.batch_size = 200
     train_model(config)

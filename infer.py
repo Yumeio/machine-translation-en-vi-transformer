@@ -114,7 +114,6 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
     # Return the best sequence
     return candidates[0][1].squeeze(0)
 
-
 def translate_sentence(model, tokenizer_src, tokenizer_tgt, device, text, beam_size=None, max_seq_len=100):
     # Encode source text
     enc_input_tokens = tokenizer_src.encode(text).ids
@@ -148,5 +147,5 @@ if __name__ == "__main__":
     print(f"Greedy: {greedy_out}")
     
     # Beam Search
-    beam_out = translate_sentence(model, tokenizer_src, tokenizer_tgt, device, t, beam_size=3, max_seq_len=config.model.max_seq_len)
-    print(f"Beam (k=3): {beam_out}")
+    beam_out = translate_sentence(model, tokenizer_src, tokenizer_tgt, device, t, beam_size=4, max_seq_len=config.model.max_seq_len)
+    print(f"Beam (k=4): {beam_out}")
