@@ -28,6 +28,7 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 16
+    num_workers: int = 4
     num_epochs: int = 20
     lr: float = 4e-4
     weight_decay: float = 1e-5
@@ -36,7 +37,6 @@ class TrainingConfig:
     model_basename: str = "tmodel_"
     preload: Optional[str] = None
     experiment_name: str = "runs/tmodel"
-
 @dataclass
 class Config:
     model: ModelConfig

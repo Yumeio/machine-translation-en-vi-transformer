@@ -67,7 +67,8 @@ def get_dataloaders(config: Config):
         train_ds,
         batch_size=config.training.batch_size,
         shuffle=True,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=config.training.num_workers
     )
 
     val_dataloader = DataLoader(
