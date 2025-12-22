@@ -3,19 +3,25 @@ import json
 import random
 import re
 import unicodedata
-import argparse
 from datasets import load_dataset
 from typing import List, Dict, Literal
 from tqdm import tqdm
-from utils import set_seed
 import pandas as pd
+import html
 
-set_seed()
+try:
+    from utils import set_seed
+    set_seed(100)
+except ImportError:
+    print("Warning: utils.set_seed not found, using default random seed")
+    random.seed(42)
 
 SAVE_DIR = "./dataset/processed"
 RAW_DIR = "./dataset/downloaded_data"
 
 def clean_text(text: str) -> str:
+    # Decode HTML entities
+    text = html.unescape(text)
 
     # Chuẩn hóa Unicode
     text = unicodedata.normalize("NFKC", text)
@@ -63,10 +69,14 @@ def prepare_training_dataset(output_format: Literal["jsonl", "parquet"] = "parqu
 
     processed_count = 0
     skipped_count = 0
+    skipped_empty = 0
+    skipped_ratio = 0  
+    skipped_duplicate = 0
 
     data = []
+    pairs = set()
     
-    for i in tqdm(range(total_rows)):
+    for i in tqdm(range(total_rows), desc="Processing training data"):
         try:
             en_text = clean_text(en_list[i])
             vi_text = clean_text(vi_list[i])
@@ -76,8 +86,25 @@ def prepare_training_dataset(output_format: Literal["jsonl", "parquet"] = "parqu
                     len(en_text) < 2\
                     or len(vi_text) < 2:
                 skipped_count += 1
+                skipped_empty += 1
                 continue
-
+            
+            en_len = len(en_text.split())
+            vi_len = len(vi_text.split())
+            length_ratio = max(en_len, vi_len) / max(min(en_len, vi_len), 1)
+            
+            if length_ratio > 3.0:
+                skipped_count += 1
+                skipped_ratio += 1
+                continue
+            
+            pair_hash = hash((en_text, vi_text))
+            if pair_hash in pairs:
+                skipped_count += 1
+                skipped_duplicate += 1
+                continue
+            pairs.add(pair_hash)
+            
             data.append({
                 "translation": {
                     "en": en_text,
@@ -92,7 +119,13 @@ def prepare_training_dataset(output_format: Literal["jsonl", "parquet"] = "parqu
 
     random.shuffle(data)
     
-    print(f"Processed {processed_count} rows, skipped {skipped_count} rows")
+    print(f"Processing Statistics:")
+    print(f"Total processed: {processed_count:,} samples")
+    print(f"Total skipped: {skipped_count:,} samples")
+    print(f"  - Empty/too short: {skipped_empty:,}")
+    print(f"  - Length ratio > 3.0: {skipped_ratio:,}")
+    print(f"  - Duplicates: {skipped_duplicate:,}")
+    print("\n")
     
     if output_format == "jsonl":
         print(f"Saving as JSONL to {output_file}...")
@@ -138,6 +171,11 @@ def prepare_validation_data(output_format: Literal["jsonl", "parquet"] = "parque
     data = []
     processed_count = 0
     skipped_count = 0
+    skipped_empty = 0
+    skipped_ratio = 0
+    skipped_duplicate = 0
+    
+    pairs = set()
 
     for dataset_name, files in val_files.items():
         print(f"Processing {dataset_name}...")
@@ -164,7 +202,23 @@ def prepare_validation_data(output_format: Literal["jsonl", "parquet"] = "parque
                         len(en_text) < 2\
                         or len(vi_text) < 2:
                     skipped_count += 1
+                    skipped_empty += 1
                     continue
+                
+                en_len = len(en_text.split())
+                vi_len = len(vi_text.split())
+                length_ratio = max(en_len, vi_len) / max(min(en_len, vi_len), 1)
+                if length_ratio > 3.0:
+                    skipped_count += 1
+                    skipped_ratio += 1
+                    continue
+                
+                pair_hash = hash((en_text, vi_text))
+                if pair_hash in pairs:
+                    skipped_count += 1
+                    skipped_duplicate += 1
+                    continue
+                pairs.add(pair_hash)
 
                 data.append({
                     "translation": {
@@ -177,8 +231,15 @@ def prepare_validation_data(output_format: Literal["jsonl", "parquet"] = "parque
                 print(f"Error processing row {i} in {dataset_name}: {e}")
                 skipped_count += 1    
                 continue
-    
-    print(f"Processed {processed_count} rows, skipped {skipped_count} rows")
+
+    random.shuffle(data)
+    print(f"Processing Statistics:")
+    print(f"Total processed: {processed_count:,} samples")
+    print(f"Total skipped: {skipped_count:,} samples")
+    print(f"  - Empty/too short: {skipped_empty:,}")
+    print(f"  - Length ratio > 3.0: {skipped_ratio:,}")
+    print(f"  - Duplicates: {skipped_duplicate:,}")
+    print("\n") 
     
     if output_format == "jsonl":
         print(f"Saving as JSONL to {output_file}...")

@@ -2,52 +2,61 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Literal
 
 class InputEmbeddings(nn.Module):
-    def __init__(self, d_model: int, vocab_size: int) -> None:
+    def __init__(
+        self, 
+        d_model: int, 
+        vocab_size: int
+    ) -> None:
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.scale = math.sqrt(d_model)
 
     def forward(self, x):
-        return self.embedding(x) * math.sqrt(self.d_model)
+        return self.embedding(x) * self.scale
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_seq_len: int) -> None: 
+    def __init__(
+        self, 
+        d_model: int, 
+        max_seq_len: int = 5000, 
+        dropout: float = 0.1
+    ) -> None: 
         super().__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
-
+        self.dropout = nn.Dropout(dropout)
+        
         self.register_buffer("positional_encoding", self._get_positional_encoding(d_model, max_seq_len))
 
     def _get_positional_encoding(self, d_model: int, max_seq_len: int) -> torch.Tensor:
         pe = torch.zeros(max_seq_len, d_model)
         position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
+        )
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)
 
     def forward(self, x):
-        x = x + (self.positional_encoding[:, :x.shape[1], :]).requires_grad_(False)
-        return x
+        x = x + (self.positional_encoding[:, :x.shape[1], :])
+        return self.dropout(x)
 
 class LayerNormalization(nn.Module):
-    def __init__(self, d_model: int, eps: float = 10**-6) -> None:
+    def __init__(self, d_model: int, eps: float = 1e-5) -> None:
         super().__init__()
         self.eps = eps
         self.alpha = nn.Parameter(torch.ones(d_model)) # alpha is a learnable parameter
         self.bias = nn.Parameter(torch.zeros(d_model)) # bias is a learnable parameter
 
     def forward(self, x):
-        # x: (batch, seq_len, d_model)
-        # Keep the dimension for broadcasting
         mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # Keep the dimension for broadcasting
         std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # eps is to prevent dividing by zero or when std is very small
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
 
 class FeedForwardBlock(nn.Module):
@@ -56,18 +65,14 @@ class FeedForwardBlock(nn.Module):
         self.gate = nn.Linear(d_model, d_ff)
         self.down = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activation = activation
+        
+        if activation not in ["relu", "gelu"]:
+            raise ValueError(f"Unknown activation function: {activation}")
+        self.activation = F.gelu if activation == "gelu" else F.relu
 
     def forward(self, x):
-        if self.activation == "relu":
-            activation = F.relu
-        elif self.activation == "gelu":
-            activation = F.gelu
-        else:
-            raise ValueError(f"Unknown activation function: {self.activation}")
-
         x = self.gate(x)
-        x = activation(x)
+        x = self.activation(x)
         x = self.down(x)
         x = self.dropout(x)
         return x
@@ -95,6 +100,8 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
+        
+        self.attention_weights = None
 
     @staticmethod
     def _scaled_dot_product_attention(q, k, v, mask, dropout: nn.Dropout):
@@ -105,14 +112,18 @@ class MultiHeadAttentionBlock(nn.Module):
         
         d_k = k.shape[-1]
         attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(d_k)
+        
         if mask is not None:
             attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
         attention_weights = F.softmax(attention_scores, dim=-1)
+        
         if dropout is not None:
             attention_weights = dropout(attention_weights)
         return (attention_weights @ v), attention_weights
 
     def forward(self, q, k, v, mask=None):
+        batch_size = q.shape[0]
+        
         query = self.w_q(q)
         key = self.w_k(k)
         value = self.w_v(v)
@@ -121,8 +132,10 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.num_heads, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.num_heads, self.d_k).transpose(1, 2)
 
-        x, self.attention_weights = self._scaled_dot_product_attention(query, key, value, mask, self.dropout)
-        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.num_heads * self.d_k)
+        x, self.attention_weights = self._scaled_dot_product_attention(
+            query, key, value, mask, self.dropout
+        )
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.d_k)
         return self.w_o(x)
 
 class EncoderBlock(nn.Module):
@@ -170,8 +183,6 @@ class Encoder(nn.Module):
         for layer in self.layers:
             x = layer(x, src_mask)
         return self.norm(x)
-
-
 class DecoderBlock(nn.Module):
     def __init__(
         self, 
@@ -199,7 +210,6 @@ class DecoderBlock(nn.Module):
         # Feed-forward sublayer
         x = self.residual_connections[2](x, self.feed_forward)
         return x
-
 class Decoder(nn.Module):
     def __init__(
         self, 
@@ -242,9 +252,12 @@ class Transformer(nn.Module):
         num_decoder_blocks: int,
         src_vocab_size: int,
         tgt_vocab_size: int,
-        max_seq_len: int
+        max_seq_len: int,
+        use_gradient_checkpointing: bool = False,
+        tie_weights: bool = True
     ) -> None:
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Embeddings and Positional Encoding
         self.src_embedding = InputEmbeddings(d_model, src_vocab_size)
@@ -258,26 +271,54 @@ class Transformer(nn.Module):
         
         # Projection layer
         self.projection = ProjectionLayer(d_model, tgt_vocab_size)
-        self._init_xavier_weights()
-    
-    def _init_xavier_weights(self):
+        
+        # Weight tying
+        if tie_weights:
+            self.projection.projection.weight = self.tgt_embedding.embedding.weight
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+            elif isinstance(module, LayerNormalization):
+                nn.init.ones_(module.alpha)
+                nn.init.zeros_(module.bias)
 
-    def _sum_parameter(self):
+    @property
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    @property
+    def num_trainable_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def encode(self, src, src_mask):
         src = self.src_embedding(src)
         src = self.src_pos_encoding(src)
+        
+        if self.use_gradient_checkpointing and self.training:
+            return checkpoint(
+                self.encoder, src, src_mask, use_reentrant=True
+            )
+        
         return self.encoder(src, src_mask)
 
     def decode(self, tgt, context, src_mask, tgt_mask):
         tgt = self.tgt_embedding(tgt)
         tgt = self.tgt_pos_encoding(tgt)
+        
+        if self.use_gradient_checkpointing and self.training:
+            return checkpoint(
+                self.decoder, tgt, context, src_mask, tgt_mask, use_reentrant=True
+            )
+            
         return self.decoder(tgt, context, src_mask, tgt_mask)
 
     def project(self, x):
@@ -287,5 +328,3 @@ class Transformer(nn.Module):
         encoder_output = self.encode(src, src_mask)
         decoder_output = self.decode(tgt, encoder_output, src_mask, tgt_mask)
         return self.project(decoder_output)
-
-    
