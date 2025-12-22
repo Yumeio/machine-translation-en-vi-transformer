@@ -206,7 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-dataset/*
+dataset/processed/*
+dataset/downloaded_data/*
 runs/*
 weights/*
 tokenizer_*.json

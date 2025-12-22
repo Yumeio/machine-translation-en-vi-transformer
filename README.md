@@ -1,45 +1,47 @@
 # Machine Translation En-Vi Transformer
 
-Dự án dịch máy Anh-Việt sử dụng mô hình Transformer.
+English-Vietnamese machine translation project using the Transformer model.
 
-## Cài đặt
+[Tiếng Việt](./README_vi.md)
 
-Cài đặt các thư viện cần thiết:
+## Installation
+
+Install required libraries:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Huấn luyện (Training)
+## Training
 
-Để bắt đầu huấn luyện mô hình:
+To start training the model:
 
 ```bash
 python train.py
 ```
 
-- Mô hình sẽ được lưu trong thư mục `weights/`.
-- File cấu hình nằm ở `config.py`.
-- Biểu đồ Loss sẽ được lưu tại `loss_plot.png`.
+- Models will be saved in the `weights/` directory.
+- Configuration file is located at `config.py`.
+- Loss chart will be saved at `loss_plot.png`.
 
-## Dự đoán (Inference)
+## Inference
 
-Để chạy thử nghiệm dịch:
+To run translation testing:
 
 ```bash
 python infer.py
 ```
 
-- Script sẽ tự động load weights mới nhất hoặc weights được chỉ định trong `infer.py`.
-- Hiện tại script đang chạy dịch thử một câu mẫu tiếng Anh sang tiếng Việt.
+- The script will automatically load the latest weights or specified weights in `infer.py`.
+- Currently, the script is translating a sample English sentence into Vietnamese.
 
-## Chạy lấy điểm BLEU
+## Evaluation (BLEU Score)
 
 ```bash
 python eval.py
 ```
 
-Kết quả:
+Results:
 - **BLEU Score**: [24.05]
 
 ## References
