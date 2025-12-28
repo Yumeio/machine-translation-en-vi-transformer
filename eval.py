@@ -41,6 +41,11 @@ def load_model(config, device, checkpoint_path=None):
         tgt_vocab_size=tokenizer_tgt.get_vocab_size(),
         max_seq_len=config.model.max_seq_len,
         tie_weights=config.model.tie_weights,
+        use_rmsnorm=config.model.use_rmsnorm,
+        use_qknorm=config.model.use_qknorm,
+        use_rope=config.model.use_rope,
+        use_swiglu=config.model.use_swiglu,
+        rope_base=config.model.rope_base
     ).to(device)
     if checkpoint_path is None:
         weights_path = latest_weights_file_path(config)

@@ -43,6 +43,11 @@ def get_model(config, vocab_src_len, vocab_tgt_len, device):
         tgt_vocab_size=vocab_tgt_len,
         max_seq_len=config.model.max_seq_len,
         tie_weights=config.model.tie_weights,
+        use_rmsnorm=config.model.use_rmsnorm,
+        use_qknorm=config.model.use_qknorm,
+        use_rope=config.model.use_rope,
+        use_swiglu=config.model.use_swiglu,
+        rope_base=config.model.rope_base
     )
     
     model = model.to(device)

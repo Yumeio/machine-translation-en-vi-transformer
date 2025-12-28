@@ -25,6 +25,11 @@ class ModelConfig:
     tgt_vocab_size: Optional[int] = 30000 
     tie_weights: bool = True
 
+    use_rmsnorm: bool = True       
+    use_qknorm: bool = True        
+    use_rope: bool = True         
+    use_swiglu: bool = True        
+    rope_base: float = 10000.0 
 @dataclass
 class TrainingConfig:
     batch_size: int = 64 

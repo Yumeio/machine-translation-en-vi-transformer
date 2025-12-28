@@ -47,6 +47,47 @@ class PositionalEncoding(nn.Module):
         x = x + (self.positional_encoding[:, :x.shape[1], :])
         return self.dropout(x)
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 5000, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(max_seq_len)
+
+    def _set_cos_sin_cache(self, seq_len: int):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None):
+        if seq_len is None:
+            seq_len = x.shape[1]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len)
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 class LayerNormalization(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5) -> None:
         super().__init__()
@@ -58,6 +99,54 @@ class LayerNormalization(nn.Module):
         mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
         std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+class QKNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, use_rmsnorm: bool = True):
+        super().__init__()
+        if use_rmsnorm:
+            self.query_norm = RMSNorm(dim, eps=eps)
+            self.key_norm = RMSNorm(dim, eps=eps)
+        else:
+            self.query_norm = nn.LayerNorm(dim, eps=eps)
+            self.key_norm = nn.LayerNorm(dim, eps=eps)
+
+    def forward(self, q, k):
+        q = self.query_norm(q)
+        k = self.key_norm(k)
+        return q, k
+
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: Optional[int] = None,
+        multiple_of: int = 256,
+        dropout: float = 0.0,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if d_ff is None:
+            d_ff = 4 * d_model
+            d_ff = int(2 * d_ff / 3)
+            d_ff = multiple_of * ((d_ff + multiple_of - 1) // multiple_of)
+        
+        self.w1 = nn.Linear(d_model, d_ff, bias=bias)
+        self.w2 = nn.Linear(d_ff, d_model, bias=bias)
+        self.w3 = nn.Linear(d_model, d_ff, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 class FeedForwardBlock(nn.Module):
     def __init__(self, d_model: int, d_ff: int, activation: Literal['relu', 'gelu'], dropout: float) -> None:
@@ -78,19 +167,30 @@ class FeedForwardBlock(nn.Module):
         return x
 
 class ResidualConnection(nn.Module):
-    def __init__(self, d_model: int, dropout: float) -> None:
+    def __init__(self, d_model: int, dropout: float, use_rmsnorm: bool = False) -> None:
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = LayerNormalization(d_model)
+        if use_rmsnorm:
+            self.layer_norm = RMSNorm(d_model)
+        else:
+            self.layer_norm = LayerNormalization(d_model)
 
     def forward(self, x, sublayer):
         return x + self.dropout(sublayer(self.layer_norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self, 
+        d_model: int, 
+        num_heads: int, 
+        dropout: float,
+        use_rmsnorm: bool = True,
+        use_qknorm: bool = True,
+    ) -> None:
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+        self.use_qknorm = use_qknorm
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
         self.d_k = d_model // num_heads
@@ -100,6 +200,11 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
+
+        if use_qknorm:
+            self.qk_norm = QKNorm(self.d_k, use_rmsnorm=use_rmsnorm)
+        else:
+            self.qk_norm = None
         
         self.attention_weights = None
 
@@ -121,7 +226,7 @@ class MultiHeadAttentionBlock(nn.Module):
             attention_weights = dropout(attention_weights)
         return (attention_weights @ v), attention_weights
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, mask=None, rope=None):
         batch_size = q.shape[0]
         
         query = self.w_q(q)
@@ -131,6 +236,33 @@ class MultiHeadAttentionBlock(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.num_heads, self.d_k).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.num_heads, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.num_heads, self.d_k).transpose(1, 2)
+
+        if rope is not None:
+            cos, sin = rope
+            # Apply RoPE to query and key
+            query_rot = query.transpose(1, 2)  # [bs, seq, heads, dim]
+            key_rot = key.transpose(1, 2)
+            query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
+            query = query_rot.transpose(1, 2)  # Back to [bs, heads, seq, dim]
+            key = key_rot.transpose(1, 2)
+
+        if self.qk_norm is not None:
+            # Transpose to apply norm per head dim
+            query = query.transpose(1, 2)  # [bs, seq, heads, dim]
+            key = key.transpose(1, 2)
+            
+            # Apply QK norm
+            orig_shape = query.shape
+            query_flat = query.reshape(-1, self.d_k)
+            key_flat = key.reshape(-1, self.d_k)
+            query_flat, key_flat = self.qk_norm(query_flat, key_flat)
+            query = query_flat.reshape(orig_shape)
+            key = key_flat.reshape(orig_shape)
+            
+            # Transpose back
+            query = query.transpose(1, 2)  # [bs, heads, seq, dim]
+            key = key.transpose(1, 2)
+
 
         x, self.attention_weights = self._scaled_dot_product_attention(
             query, key, value, mask, self.dropout
@@ -145,14 +277,23 @@ class EncoderBlock(nn.Module):
         num_heads: int, 
         d_ff: int, 
         activation: Literal['relu', 'gelu'], 
-        dropout: float
+        dropout: float,
+        use_rmsnorm: bool = False,
+        use_qknorm: bool = False,
+        use_swiglu: bool = False
     ) -> None:
         super().__init__()
-        self.self_attention = MultiHeadAttentionBlock(d_model, num_heads, dropout)
-        self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
+        self.self_attention = MultiHeadAttentionBlock(
+            d_model, num_heads, dropout, use_rmsnorm, use_qknorm
+            )
+        if use_swiglu:
+            self.feed_forward = SwiGLU(d_model, d_ff, dropout=dropout)
+        else:
+            self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
+
         self.residual_connections = nn.ModuleList([
-            ResidualConnection(d_model, dropout), # For self-attention
-            ResidualConnection(d_model, dropout)  # For feed-forward
+            ResidualConnection(d_model, dropout, use_rmsnorm), # For self-attention
+            ResidualConnection(d_model, dropout, use_rmsnorm)  # For feed-forward
         ])
 
     def forward(self, x, src_mask):
@@ -170,19 +311,29 @@ class Encoder(nn.Module):
         d_ff: int, 
         activation: Literal['relu', 'gelu'], 
         dropout: float, 
-        num_blocks: int
+        num_blocks: int,
+        use_rmsnorm: bool = False,
+        use_qknorm: bool = False,
+        use_swiglu: bool = False
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            EncoderBlock(d_model, num_heads, d_ff, activation, dropout) 
+            EncoderBlock(
+                d_model, num_heads, d_ff, activation, dropout,
+                use_rmsnorm, use_qknorm, use_swiglu
+                ) 
             for _ in range(num_blocks)
         ])
-        self.norm = nn.LayerNorm(d_model)
+        if use_rmsnorm:
+            self.norm = RMSNorm(d_model)
+        else:
+            self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, src_mask):
         for layer in self.layers:
             x = layer(x, src_mask)
         return self.norm(x)
+
 class DecoderBlock(nn.Module):
     def __init__(
         self, 
@@ -190,12 +341,23 @@ class DecoderBlock(nn.Module):
         num_heads: int, 
         d_ff: int, 
         activation: Literal['relu', 'gelu'], 
-        dropout: float
+        dropout: float,
+        use_rmsnorm: bool = False,
+        use_qknorm: bool = False,
+        use_swiglu: bool = False
     ) -> None:
         super().__init__()
-        self.self_attention = MultiHeadAttentionBlock(d_model, num_heads, dropout)
-        self.cross_attention = MultiHeadAttentionBlock(d_model, num_heads, dropout)
-        self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
+        self.self_attention = MultiHeadAttentionBlock(
+            d_model, num_heads, dropout, use_rmsnorm, use_qknorm
+            )
+        self.cross_attention = MultiHeadAttentionBlock(
+            d_model, num_heads, dropout, use_rmsnorm, use_qknorm
+            )
+        if use_swiglu:
+            self.feed_forward = SwiGLU(d_model, d_ff, dropout=dropout)
+        else:
+            self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
+
         self.residual_connections = nn.ModuleList([
             ResidualConnection(d_model, dropout), # For self-attention
             ResidualConnection(d_model, dropout), # For cross-attention
@@ -210,6 +372,7 @@ class DecoderBlock(nn.Module):
         # Feed-forward sublayer
         x = self.residual_connections[2](x, self.feed_forward)
         return x
+
 class Decoder(nn.Module):
     def __init__(
         self, 
@@ -218,14 +381,23 @@ class Decoder(nn.Module):
         d_ff: int, 
         activation: Literal['relu', 'gelu'], 
         dropout: float, 
-        num_blocks: int
+        num_blocks: int,
+        use_rmsnorm: bool = False,
+        use_qknorm: bool = False,
+        use_swiglu: bool = False
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            DecoderBlock(d_model, num_heads, d_ff, activation, dropout) 
+            DecoderBlock(
+                d_model, num_heads, d_ff, activation, dropout,
+                use_rmsnorm, use_qknorm, use_swiglu
+            ) 
             for _ in range(num_blocks)
         ])
-        self.norm = LayerNormalization(d_model)
+        if use_rmsnorm:
+            self.norm = RMSNorm(d_model)
+        else:
+            self.norm = LayerNormalization(d_model)
 
     def forward(self, x, context, src_mask, tgt_mask):
         for layer in self.layers:
@@ -254,20 +426,55 @@ class Transformer(nn.Module):
         tgt_vocab_size: int,
         max_seq_len: int,
         use_gradient_checkpointing: bool = False,
-        tie_weights: bool = True
+        tie_weights: bool = True,
+
+        use_rmsnorm: bool = True,
+        use_qknorm: bool = True,
+        use_rope: bool = True,
+        use_swiglu: bool = True,
+        rope_base: float = 10000.0
     ) -> None:
         super().__init__()
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        
+        self.use_rope = use_rope
+
+        features = []
+        if use_rmsnorm:
+            features.append("RMSNorm")
+        if use_qknorm:
+            features.append("QKNorm")
+        if use_rope:
+            features.append("RoPE")
+        if use_swiglu:
+            features.append("SwiGLU")
+        print(f"Building Transformer with features: {', '.join(features) if features else 'Base (no improvements)'}")
+
+
         # Embeddings and Positional Encoding
         self.src_embedding = InputEmbeddings(d_model, src_vocab_size)
-        self.src_pos_encoding = PositionalEncoding(d_model, max_seq_len)
         self.tgt_embedding = InputEmbeddings(d_model, tgt_vocab_size)
-        self.tgt_pos_encoding = PositionalEncoding(d_model, max_seq_len)
+         if use_rope:
+            self.rope = RotaryEmbedding(
+                dim=d_model // num_heads,
+                max_seq_len=max_seq_len,
+                base=rope_base
+            )
+            self.src_pos_encoding = nn.Dropout(dropout)  # Just dropout, no pos encoding
+            self.tgt_pos_encoding = nn.Dropout(dropout)
+        else:
+            self.rope = None
+            self.src_pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
+            self.tgt_pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
 
         # Encoder and Decoder
-        self.encoder = Encoder(d_model, num_heads, d_ff, activation, dropout, num_encoder_blocks)
-        self.decoder = Decoder(d_model, num_heads, d_ff, activation, dropout, num_decoder_blocks)
+        self.encoder = Encoder(
+            d_model, num_heads, d_ff, activation, dropout, num_encoder_blocks,
+            use_rmsnorm, use_qknorm, use_swiglu
+        )
+        self.decoder = Decoder(
+            d_model, num_heads, d_ff, activation, dropout, num_decoder_blocks,
+            use_rmsnorm, use_qknorm, use_swiglu
+        )
         
         # Projection layer
         self.projection = ProjectionLayer(d_model, tgt_vocab_size)
@@ -290,7 +497,8 @@ class Transformer(nn.Module):
             elif isinstance(module, LayerNormalization):
                 nn.init.ones_(module.alpha)
                 nn.init.zeros_(module.bias)
-
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
     @property
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -301,26 +509,37 @@ class Transformer(nn.Module):
     
     def encode(self, src, src_mask):
         src = self.src_embedding(src)
-        src = self.src_pos_encoding(src)
+        rope = None
+        if self.rope is not None:
+            cos, sin = self.rope(src)
+            rope = (cos, sin)
+            src = self.src_pos_encoding(src)  # Just dropout
+        else:
+            src = self.src_pos_encoding(src)  # Full positional encoding
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(
-                self.encoder, src, src_mask, use_reentrant=True
+                self.encoder, src, src_mask, rope, use_reentrant=True
             )
         
-        return self.encoder(src, src_mask)
+        return self.encoder(src, src_mask, rope)
 
     def decode(self, tgt, context, src_mask, tgt_mask):
         tgt = self.tgt_embedding(tgt)
-        tgt = self.tgt_pos_encoding(tgt)
+        rope = None
+        if self.rope is not None:
+            cos, sin = self.rope(tgt)
+            rope = (cos, sin)
+            tgt = self.tgt_pos_encoding(tgt)  # Just dropout
+        else:
+            tgt = self.tgt_pos_encoding(tgt)  # Full positional encoding
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(
-                self.decoder, tgt, context, src_mask, tgt_mask, use_reentrant=True
+                self.decoder, tgt, context, src_mask, tgt_mask, rope, use_reentrant=True
             )
             
-        return self.decoder(tgt, context, src_mask, tgt_mask)
-
+        return self.decoder(tgt, context, src_mask, tgt_mask, rope)
     def project(self, x):
         return self.projection(x)
 
