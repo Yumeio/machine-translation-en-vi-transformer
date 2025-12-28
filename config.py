@@ -14,7 +14,7 @@ class DatasetConfig:
 @dataclass
 class ModelConfig:
     d_model: int = 512        
-    num_heads: int = 4         
+    num_heads: int = 8        
     d_ff: int = (512 * 4)          
     num_encoder_blocks: int = 6
     num_decoder_blocks: int = 6  
