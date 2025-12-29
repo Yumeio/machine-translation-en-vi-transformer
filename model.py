@@ -3,14 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Literal
+from typing import Literal, Optional, Tuple
 
 class InputEmbeddings(nn.Module):
-    def __init__(
-        self, 
-        d_model: int, 
-        vocab_size: int
-    ) -> None:
+    def __init__(self, d_model: int, vocab_size: int) -> None:
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -21,12 +17,7 @@ class InputEmbeddings(nn.Module):
         return self.embedding(x) * self.scale
 
 class PositionalEncoding(nn.Module):
-    def __init__(
-        self, 
-        d_model: int, 
-        max_seq_len: int = 5000, 
-        dropout: float = 0.1
-    ) -> None: 
+    def __init__(self, d_model: int, max_seq_len: int = 5000, dropout: float = 0.1) -> None: 
         super().__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
@@ -82,8 +73,9 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
 def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k: (Batch, Heads, Seq, Dim)
+    # cos, sin: (Seq, Dim) -> Broadcasts to (1, 1, Seq, Dim) 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -92,12 +84,12 @@ class LayerNormalization(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5) -> None:
         super().__init__()
         self.eps = eps
-        self.alpha = nn.Parameter(torch.ones(d_model)) # alpha is a learnable parameter
-        self.bias = nn.Parameter(torch.zeros(d_model)) # bias is a learnable parameter
+        self.alpha = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
 
     def forward(self, x):
-        mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
+        mean = x.mean(dim = -1, keepdim = True)
+        std = x.std(dim = -1, keepdim = True)
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
 
 class RMSNorm(nn.Module):
@@ -210,63 +202,51 @@ class MultiHeadAttentionBlock(nn.Module):
 
     @staticmethod
     def _scaled_dot_product_attention(q, k, v, mask, dropout: nn.Dropout):
-        # q: (batch, seq_len, d_k)
-        # k: (batch, seq_len, d_k)
-        # v: (batch, seq_len, d_v)
-        # mask: (batch, seq_len, seq_len)
-        
+        # q, k, v shape: (Batch, Heads, Seq, D_k)
         d_k = k.shape[-1]
+        
+        # Attention scores: (Batch, Heads, Seq, Seq)
         attention_scores = (q @ k.transpose(-2, -1)) / math.sqrt(d_k)
         
         if mask is not None:
             attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
+        
         attention_weights = F.softmax(attention_scores, dim=-1)
         
         if dropout is not None:
             attention_weights = dropout(attention_weights)
+            
         return (attention_weights @ v), attention_weights
 
     def forward(self, q, k, v, mask=None, rope=None):
         batch_size = q.shape[0]
         
+        # 1. Linear Projections
         query = self.w_q(q)
         key = self.w_k(k)
         value = self.w_v(v)
         
-        query = query.view(query.shape[0], query.shape[1], self.num_heads, self.d_k).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.num_heads, self.d_k).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.num_heads, self.d_k).transpose(1, 2)
+        # 2. Reshape to (Batch, Heads, Seq, D_k)
+        query = query.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        key = key.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        value = value.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
 
+        # 3. Apply QKNorm (Applying BEFORE RoPE is standard practice if used)
+        if self.qk_norm is not None:
+            query, key = self.qk_norm(query, key)
+
+        # 4. Apply RoPE (Rotary Positional Embedding)
         if rope is not None:
             cos, sin = rope
-            # Apply RoPE to query and key
-            query_rot = query.transpose(1, 2)  # [bs, seq, heads, dim]
-            key_rot = key.transpose(1, 2)
-            query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
-            query = query_rot.transpose(1, 2)  # Back to [bs, heads, seq, dim]
-            key = key_rot.transpose(1, 2)
+            # apply_rotary_pos_emb handles broadcasting automatically
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        if self.qk_norm is not None:
-            # Transpose to apply norm per head dim
-            query = query.transpose(1, 2)  # [bs, seq, heads, dim]
-            key = key.transpose(1, 2)
-            
-            # Apply QK norm
-            orig_shape = query.shape
-            query_flat = query.reshape(-1, self.d_k)
-            key_flat = key.reshape(-1, self.d_k)
-            query_flat, key_flat = self.qk_norm(query_flat, key_flat)
-            query = query_flat.reshape(orig_shape)
-            key = key_flat.reshape(orig_shape)
-            
-            # Transpose back
-            query = query.transpose(1, 2)  # [bs, heads, seq, dim]
-            key = key.transpose(1, 2)
-
-
+        # 5. Scaled Dot Product Attention
         x, self.attention_weights = self._scaled_dot_product_attention(
             query, key, value, mask, self.dropout
         )
+        
+        # 6. Concatenate Heads and Output Projection
         x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.d_k)
         return self.w_o(x)
 
@@ -292,14 +272,13 @@ class EncoderBlock(nn.Module):
             self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
 
         self.residual_connections = nn.ModuleList([
-            ResidualConnection(d_model, dropout, use_rmsnorm), # For self-attention
-            ResidualConnection(d_model, dropout, use_rmsnorm)  # For feed-forward
+            ResidualConnection(d_model, dropout, use_rmsnorm), 
+            ResidualConnection(d_model, dropout, use_rmsnorm)  
         ])
 
-    def forward(self, x, src_mask):
-        # Self-attention sublayer
-        x = self.residual_connections[0](x, lambda x: self.self_attention(x, x, x, src_mask))
-        # Feed-forward sublayer
+    def forward(self, x, src_mask, rope=None):
+        # Pass rope to self_attention
+        x = self.residual_connections[0](x, lambda x: self.self_attention(x, x, x, src_mask, rope=rope))
         x = self.residual_connections[1](x, self.feed_forward)
         return x
 
@@ -329,9 +308,9 @@ class Encoder(nn.Module):
         else:
             self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, src_mask):
+    def forward(self, x, src_mask, rope=None):
         for layer in self.layers:
-            x = layer(x, src_mask)
+            x = layer(x, src_mask, rope=rope)
         return self.norm(x)
 
 class DecoderBlock(nn.Module):
@@ -359,17 +338,16 @@ class DecoderBlock(nn.Module):
             self.feed_forward = FeedForwardBlock(d_model, d_ff, activation, dropout)
 
         self.residual_connections = nn.ModuleList([
-            ResidualConnection(d_model, dropout), # For self-attention
-            ResidualConnection(d_model, dropout), # For cross-attention
-            ResidualConnection(d_model, dropout)  # For feed-forward
+            ResidualConnection(d_model, dropout), 
+            ResidualConnection(d_model, dropout), 
+            ResidualConnection(d_model, dropout)  
         ])
 
-    def forward(self, x, context, src_mask, tgt_mask):
-        # Self-attention sublayer
-        x = self.residual_connections[0](x, lambda x: self.self_attention(x, x, x, tgt_mask))
-        # Cross-attention sublayer
-        x = self.residual_connections[1](x, lambda x: self.cross_attention(x, context, context, src_mask))
-        # Feed-forward sublayer
+    def forward(self, x, context, src_mask, tgt_mask, rope=None):
+        x = self.residual_connections[0](x, lambda x: self.self_attention(x, x, x, tgt_mask, rope=rope))
+        x = self.residual_connections[1](x, lambda x: self.cross_attention(x, context, context, src_mask, rope=None))
+        
+        # Feed-forward
         x = self.residual_connections[2](x, self.feed_forward)
         return x
 
@@ -399,10 +377,11 @@ class Decoder(nn.Module):
         else:
             self.norm = LayerNormalization(d_model)
 
-    def forward(self, x, context, src_mask, tgt_mask):
+    def forward(self, x, context, src_mask, tgt_mask, rope=None):
         for layer in self.layers:
-            x = layer(x, context, src_mask, tgt_mask)
+            x = layer(x, context, src_mask, tgt_mask, rope=rope)
         return self.norm(x)
+
 
 class ProjectionLayer(nn.Module):
     def __init__(self, d_model: int, vocab_size: int) -> None:
@@ -439,34 +418,30 @@ class Transformer(nn.Module):
         self.use_rope = use_rope
 
         features = []
-        if use_rmsnorm:
-            features.append("RMSNorm")
-        if use_qknorm:
-            features.append("QKNorm")
-        if use_rope:
-            features.append("RoPE")
-        if use_swiglu:
-            features.append("SwiGLU")
+        if use_rmsnorm: features.append("RMSNorm")
+        if use_qknorm: features.append("QKNorm")
+        if use_rope: features.append("RoPE")
+        if use_swiglu: features.append("SwiGLU")
         print(f"Building Transformer with features: {', '.join(features) if features else 'Base (no improvements)'}")
 
 
         # Embeddings and Positional Encoding
         self.src_embedding = InputEmbeddings(d_model, src_vocab_size)
         self.tgt_embedding = InputEmbeddings(d_model, tgt_vocab_size)
-         if use_rope:
+        
+        if use_rope:
             self.rope = RotaryEmbedding(
                 dim=d_model // num_heads,
                 max_seq_len=max_seq_len,
                 base=rope_base
             )
-            self.src_pos_encoding = nn.Dropout(dropout)  # Just dropout, no pos encoding
+            self.src_pos_encoding = nn.Dropout(dropout) 
             self.tgt_pos_encoding = nn.Dropout(dropout)
         else:
             self.rope = None
             self.src_pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
             self.tgt_pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
 
-        # Encoder and Decoder
         self.encoder = Encoder(
             d_model, num_heads, d_ff, activation, dropout, num_encoder_blocks,
             use_rmsnorm, use_qknorm, use_swiglu
@@ -476,14 +451,11 @@ class Transformer(nn.Module):
             use_rmsnorm, use_qknorm, use_swiglu
         )
         
-        # Projection layer
         self.projection = ProjectionLayer(d_model, tgt_vocab_size)
         
-        # Weight tying
         if tie_weights:
             self.projection.projection.weight = self.tgt_embedding.embedding.weight
         
-        # Initialize weights
         self._init_weights()
         
     def _init_weights(self):
@@ -499,6 +471,7 @@ class Transformer(nn.Module):
                 nn.init.zeros_(module.bias)
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
+
     @property
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -511,11 +484,12 @@ class Transformer(nn.Module):
         src = self.src_embedding(src)
         rope = None
         if self.rope is not None:
+            # Calculate RoPE cos/sin for this sequence length
             cos, sin = self.rope(src)
             rope = (cos, sin)
-            src = self.src_pos_encoding(src)  # Just dropout
+            src = self.src_pos_encoding(src)
         else:
-            src = self.src_pos_encoding(src)  # Full positional encoding
+            src = self.src_pos_encoding(src)
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(
@@ -528,11 +502,12 @@ class Transformer(nn.Module):
         tgt = self.tgt_embedding(tgt)
         rope = None
         if self.rope is not None:
+            # Calculate RoPE cos/sin for this sequence length
             cos, sin = self.rope(tgt)
             rope = (cos, sin)
-            tgt = self.tgt_pos_encoding(tgt)  # Just dropout
+            tgt = self.tgt_pos_encoding(tgt)
         else:
-            tgt = self.tgt_pos_encoding(tgt)  # Full positional encoding
+            tgt = self.tgt_pos_encoding(tgt)
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(
@@ -540,6 +515,7 @@ class Transformer(nn.Module):
             )
             
         return self.decoder(tgt, context, src_mask, tgt_mask, rope)
+
     def project(self, x):
         return self.projection(x)
 

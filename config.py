@@ -18,7 +18,7 @@ class ModelConfig:
     d_ff: int = (512 * 4)          
     num_encoder_blocks: int = 6
     num_decoder_blocks: int = 6  
-    dropout: float = 0.1       
+    dropout: float = 0.15  
     activation: Literal['relu', 'gelu'] = "relu"
     max_seq_len: int = 128     
     src_vocab_size: Optional[int] = 30000 

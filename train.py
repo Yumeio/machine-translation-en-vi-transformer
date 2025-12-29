@@ -9,7 +9,7 @@ from pathlib import Path
 import warnings
 import matplotlib.pyplot as plt
 
-from config import get_config, save_config
+from config import get_config, save_config, ModelConfig
 from data_loader import get_dataloaders
 from model import Transformer
 from lr_scheduler import LRScheduler
@@ -108,7 +108,7 @@ def train_model():
     optimizer = AdamW(
         model.parameters(), 
         lr=config.training.lr, 
-        betas=(0.9, 0.98),
+        betas=(0.9, 0.998),
         eps=1e-9,
         weight_decay=config.training.weight_decay
     )
