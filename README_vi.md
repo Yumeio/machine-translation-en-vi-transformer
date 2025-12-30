@@ -22,7 +22,8 @@ python train.py
 
 - Mô hình sẽ được lưu trong thư mục `weights/`.
 - File cấu hình nằm ở `config.py`.
-- Biểu đồ Loss sẽ được lưu tại `loss_plot.png`.
+- Biểu đồ Loss:
+  ![Training and Validation Losses](training_validation_losses.png)
 
 ## Dự đoán (Inference)
 

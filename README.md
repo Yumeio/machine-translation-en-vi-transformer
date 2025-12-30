@@ -22,7 +22,8 @@ python train.py
 
 - Models will be saved in the `weights/` directory.
 - Configuration file is located at `config.py`.
-- Loss chart will be saved at `loss_plot.png`.
+- Loss chart:
+  ![Training and Validation Losses](training_validation_losses.png)
 
 ## Inference
 
